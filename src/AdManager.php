@@ -13,29 +13,26 @@ use Reactor\Contracts\LoggerInterface;
 /**
  * Default AdManagerInterface implementation.
  *
- * Values are stored in a dedicated "ad_settings" table (key/value
- * string rows) created by the package migration. A short in-process
- * cache keeps repeated reads within one request from hitting the
- * database; every write refreshes the cache entry.
+ * Slot data is stored as JSON in a single key/value row per slot:
  *
- * Delivery uses copy/forward of a source chat+message so the admin can
- * update the ad content without redeploying: change the message, keep
- * the same message_id, and the next delivery picks up the new content.
+ *   key   = "slot:{name}"
+ *   value = {"strategy":"copy","chat_id":"-100...","message_id":42,
+ *            "probability":30,"enabled":true}
+ *
+ * A short in-process cache keeps repeated reads within one request
+ * from hitting the database; every write refreshes the cache entry for
+ * that key.
+ *
+ * Delivery uses copy/forward of the stored source message so the
+ * operator can edit the source content without redeploying: change the
+ * message text in place, keep the same message_id, and the next
+ * delivery picks up the new content.
  */
 class AdManager implements AdManagerInterface
 {
-    public const KEY_RANDOM_ENABLED     = 'random_ad_enabled';
-    public const KEY_RANDOM_STRATEGY    = 'random_ad_strategy';
-    public const KEY_RANDOM_CHAT_ID     = 'random_ad_chat_id';
-    public const KEY_RANDOM_MESSAGE_ID  = 'random_ad_message_id';
-    public const KEY_RANDOM_PROBABILITY = 'random_ad_probability';
-
-    public const KEY_START_ENABLED    = 'start_ad_enabled';
-    public const KEY_START_STRATEGY   = 'start_ad_strategy';
-    public const KEY_START_CHAT_ID    = 'start_ad_chat_id';
-    public const KEY_START_MESSAGE_ID = 'start_ad_message_id';
-
+    private const SLOT_PREFIX = 'slot:';
     private const VALID_STRATEGIES = ['copy', 'forward'];
+    private const NAME_PATTERN = '/^[A-Za-z0-9_-]{1,32}$/';
 
     /**
      * @var array<string, string>
@@ -53,166 +50,188 @@ class AdManager implements AdManagerInterface
     }
 
     // -----------------------------------------------------------------
-    // Random ad
+    // Slot lifecycle
     // -----------------------------------------------------------------
 
-    public function isRandomEnabled(): bool
+    public function createSlot(string $name): void
     {
-        return $this->getInt(self::KEY_RANDOM_ENABLED, 0) === 1;
-    }
+        $this->validateName($name);
 
-    public function setRandomEnabled(bool $enabled): void
-    {
-        $this->set(self::KEY_RANDOM_ENABLED, $enabled ? '1' : '0');
-    }
-
-    public function randomProbability(): int
-    {
-        return max(0, min(100, $this->getInt(self::KEY_RANDOM_PROBABILITY, 0)));
-    }
-
-    public function setRandomProbability(int $probability): void
-    {
-        $this->set(
-            self::KEY_RANDOM_PROBABILITY,
-            (string) max(0, min(100, $probability))
-        );
-    }
-
-    public function randomStrategy(): string
-    {
-        $value = $this->get(self::KEY_RANDOM_STRATEGY, 'copy');
-        return in_array($value, self::VALID_STRATEGIES, true) ? $value : 'copy';
-    }
-
-    public function randomChatId(): string
-    {
-        return $this->get(self::KEY_RANDOM_CHAT_ID, '');
-    }
-
-    public function randomMessageId(): int
-    {
-        return $this->getInt(self::KEY_RANDOM_MESSAGE_ID, 0);
-    }
-
-    public function hasRandomMessage(): bool
-    {
-        return $this->randomChatId() !== '' && $this->randomMessageId() > 0;
-    }
-
-    public function setRandomSource(string $strategy, int|string $chatId, int $messageId): void
-    {
-        $strategy = in_array($strategy, self::VALID_STRATEGIES, true) ? $strategy : 'copy';
-
-        $this->set(self::KEY_RANDOM_STRATEGY, $strategy);
-        $this->set(self::KEY_RANDOM_CHAT_ID, (string) $chatId);
-        $this->set(self::KEY_RANDOM_MESSAGE_ID, (string) $messageId);
-        $this->set(self::KEY_RANDOM_ENABLED, '1');
-    }
-
-    public function clearRandom(): void
-    {
-        $this->set(self::KEY_RANDOM_ENABLED, '0');
-        $this->set(self::KEY_RANDOM_STRATEGY, 'copy');
-        $this->set(self::KEY_RANDOM_CHAT_ID, '');
-        $this->set(self::KEY_RANDOM_MESSAGE_ID, '0');
-        $this->set(self::KEY_RANDOM_PROBABILITY, '0');
-    }
-
-    public function sendRandomAd(int $userId): void
-    {
-        if (!$this->isRandomEnabled() || !$this->hasRandomMessage()) {
+        if ($this->hasSlot($name)) {
             return;
         }
 
-        $probability = $this->randomProbability();
+        $this->saveSlot($name, $this->defaultSlot());
+    }
+
+    public function deleteSlot(string $name): void
+    {
+        $this->validateName($name);
+        $this->ensureTable();
+
+        $key = self::SLOT_PREFIX . $name;
+
+        try {
+            $this->db->table($this->config->getTable())
+                ->where('key', $key)
+                ->delete();
+        } catch (\Throwable $e) {
+            $this->logger->warning('Ad slot delete failed', [
+                'slot'  => $name,
+                'error' => $e->getMessage(),
+            ]);
+        }
+
+        unset($this->cache[$key]);
+    }
+
+    public function hasSlot(string $name): bool
+    {
+        if (!preg_match(self::NAME_PATTERN, $name)) {
+            return false;
+        }
+
+        return $this->loadSlot($name) !== null;
+    }
+
+    public function listSlots(): array
+    {
+        $this->ensureTable();
+
+        try {
+            $rows = $this->db->table($this->config->getTable())
+                ->where('key', 'like', self::SLOT_PREFIX . '%')
+                ->pluck('key')
+                ->toArray();
+        } catch (\Throwable $e) {
+            return [];
+        }
+
+        $slots = [];
+        $prefixLen = strlen(self::SLOT_PREFIX);
+        foreach ($rows as $key) {
+            $slots[] = substr((string) $key, $prefixLen);
+        }
+
+        return $slots;
+    }
+
+    // -----------------------------------------------------------------
+    // Slot configuration
+    // -----------------------------------------------------------------
+
+    public function setSource(string $name, string $strategy, int|string $chatId, int $messageId): void
+    {
+        $this->validateName($name);
+
+        $slot = $this->loadSlot($name) ?? $this->defaultSlot();
+        $slot['strategy']   = in_array($strategy, self::VALID_STRATEGIES, true) ? $strategy : 'copy';
+        $slot['chat_id']    = (string) $chatId;
+        $slot['message_id'] = $messageId;
+        $slot['enabled']    = true;
+
+        $this->saveSlot($name, $slot);
+    }
+
+    public function setProbability(string $name, int $probability): void
+    {
+        $this->validateName($name);
+
+        $slot = $this->loadSlot($name) ?? $this->defaultSlot();
+        $slot['probability'] = max(0, min(100, $probability));
+
+        $this->saveSlot($name, $slot);
+    }
+
+    public function setEnabled(string $name, bool $enabled): void
+    {
+        $this->validateName($name);
+
+        $slot = $this->loadSlot($name) ?? $this->defaultSlot();
+        $slot['enabled'] = $enabled;
+
+        $this->saveSlot($name, $slot);
+    }
+
+    public function clearSlot(string $name): void
+    {
+        $this->validateName($name);
+        $this->saveSlot($name, $this->defaultSlot());
+    }
+
+    // -----------------------------------------------------------------
+    // Slot state
+    // -----------------------------------------------------------------
+
+    public function isEnabled(string $name): bool
+    {
+        $slot = $this->loadSlot($name);
+        return $slot !== null && ($slot['enabled'] ?? false) === true;
+    }
+
+    public function getStrategy(string $name): string
+    {
+        $slot = $this->loadSlot($name);
+        $strategy = (string) ($slot['strategy'] ?? 'copy');
+        return in_array($strategy, self::VALID_STRATEGIES, true) ? $strategy : 'copy';
+    }
+
+    public function getChatId(string $name): string
+    {
+        $slot = $this->loadSlot($name);
+        return (string) ($slot['chat_id'] ?? '');
+    }
+
+    public function getMessageId(string $name): int
+    {
+        $slot = $this->loadSlot($name);
+        return (int) ($slot['message_id'] ?? 0);
+    }
+
+    public function getProbability(string $name): int
+    {
+        $slot = $this->loadSlot($name);
+        return max(0, min(100, (int) ($slot['probability'] ?? 100)));
+    }
+
+    public function hasMessage(string $name): bool
+    {
+        return $this->getChatId($name) !== '' && $this->getMessageId($name) > 0;
+    }
+
+    // -----------------------------------------------------------------
+    // Delivery
+    // -----------------------------------------------------------------
+
+    public function send(string $name, int $userId): bool
+    {
+        return $this->deliver($name, $userId);
+    }
+
+    public function sendRandom(string $name, int $userId): bool
+    {
+        if (!$this->isEnabled($name)) {
+            return false;
+        }
+
+        if (!$this->hasMessage($name)) {
+            return false;
+        }
+
+        $probability = $this->getProbability($name);
         if ($probability <= 0) {
-            return;
+            return false;
         }
 
         if (random_int(1, 100) > $probability) {
-            return;
+            return false;
         }
 
-        $this->sendAd(
-            $userId,
-            $this->randomStrategy(),
-            $this->randomChatId(),
-            $this->randomMessageId(),
-            'random'
-        );
+        return $this->deliver($name, $userId);
     }
 
     // -----------------------------------------------------------------
-    // Start ad
-    // -----------------------------------------------------------------
-
-    public function isStartEnabled(): bool
-    {
-        return $this->getInt(self::KEY_START_ENABLED, 0) === 1;
-    }
-
-    public function setStartEnabled(bool $enabled): void
-    {
-        $this->set(self::KEY_START_ENABLED, $enabled ? '1' : '0');
-    }
-
-    public function startStrategy(): string
-    {
-        $value = $this->get(self::KEY_START_STRATEGY, 'copy');
-        return in_array($value, self::VALID_STRATEGIES, true) ? $value : 'copy';
-    }
-
-    public function startChatId(): string
-    {
-        return $this->get(self::KEY_START_CHAT_ID, '');
-    }
-
-    public function startMessageId(): int
-    {
-        return $this->getInt(self::KEY_START_MESSAGE_ID, 0);
-    }
-
-    public function hasStartMessage(): bool
-    {
-        return $this->startChatId() !== '' && $this->startMessageId() > 0;
-    }
-
-    public function setStartSource(string $strategy, int|string $chatId, int $messageId): void
-    {
-        $strategy = in_array($strategy, self::VALID_STRATEGIES, true) ? $strategy : 'copy';
-
-        $this->set(self::KEY_START_STRATEGY, $strategy);
-        $this->set(self::KEY_START_CHAT_ID, (string) $chatId);
-        $this->set(self::KEY_START_MESSAGE_ID, (string) $messageId);
-        $this->set(self::KEY_START_ENABLED, '1');
-    }
-
-    public function clearStart(): void
-    {
-        $this->set(self::KEY_START_ENABLED, '0');
-        $this->set(self::KEY_START_STRATEGY, 'copy');
-        $this->set(self::KEY_START_CHAT_ID, '');
-        $this->set(self::KEY_START_MESSAGE_ID, '0');
-    }
-
-    public function sendStartAd(int $userId): void
-    {
-        if (!$this->isStartEnabled() || !$this->hasStartMessage()) {
-            return;
-        }
-
-        $this->sendAd(
-            $userId,
-            $this->startStrategy(),
-            $this->startChatId(),
-            $this->startMessageId(),
-            'start'
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Low-level
+    // Low-level escape hatch
     // -----------------------------------------------------------------
 
     public function get(string $key, string $default = ''): string
@@ -234,9 +253,8 @@ class AdManager implements AdManagerInterface
                 'error' => $e->getMessage(),
             ]);
 
-            // Do NOT cache the fallback. Caching it would freeze the
-            // default value until the process restarts, so a transient
-            // DB failure would silently mask an enabled setting.
+            // Do not cache the fallback: a transient DB failure must
+            // not freeze the default until the process restarts.
             return $default;
         }
 
@@ -249,28 +267,97 @@ class AdManager implements AdManagerInterface
         $table = $this->config->getTable();
         $now = date('Y-m-d H:i:s');
 
-        $existing = $this->db->table($table)->where('key', $key)->first();
-        if ($existing) {
-            $this->db->table($table)->where('key', $key)->update([
-                'value'      => $value,
-                'updated_at' => $now,
+        try {
+            $existing = $this->db->table($table)->where('key', $key)->first();
+            if ($existing) {
+                $this->db->table($table)->where('key', $key)->update([
+                    'value'      => $value,
+                    'updated_at' => $now,
+                ]);
+            } else {
+                $this->db->table($table)->insert([
+                    'key'        => $key,
+                    'value'      => $value,
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]);
+            }
+        } catch (\Throwable $e) {
+            $this->logger->warning('Ad settings write failed', [
+                'key'   => $key,
+                'error' => $e->getMessage(),
             ]);
-        } else {
-            $this->db->table($table)->insert([
-                'key'        => $key,
-                'value'      => $value,
-                'created_at' => $now,
-                'updated_at' => $now,
-            ]);
+            return;
         }
 
         $this->cache[$key] = $value;
     }
 
-    private function getInt(string $key, int $default = 0): int
+    // -----------------------------------------------------------------
+    // Internals
+    // -----------------------------------------------------------------
+
+    private function validateName(string $name): void
     {
-        $value = $this->get($key, (string) $default);
-        return is_numeric($value) ? (int) $value : $default;
+        if (!preg_match(self::NAME_PATTERN, $name)) {
+            throw new \InvalidArgumentException(
+                'Invalid slot name. Must match ' . self::NAME_PATTERN . ', got: ' . $name
+            );
+        }
+    }
+
+    /**
+     * @return array{strategy: string, chat_id: string, message_id: int, probability: int, enabled: bool}
+     */
+    private function defaultSlot(): array
+    {
+        return [
+            'strategy'    => 'copy',
+            'chat_id'     => '',
+            'message_id'  => 0,
+            'probability' => 100,
+            'enabled'     => false,
+        ];
+    }
+
+    /**
+     * Load and decode a slot. Missing keys are filled in with defaults
+     * so the caller can trust the returned shape.
+     *
+     * @return array{strategy: string, chat_id: string, message_id: int, probability: int, enabled: bool}|null
+     */
+    private function loadSlot(string $name): ?array
+    {
+        if (!preg_match(self::NAME_PATTERN, $name)) {
+            return null;
+        }
+
+        $this->ensureTable();
+        $key = self::SLOT_PREFIX . $name;
+
+        try {
+            $row = $this->db->table($this->config->getTable())->where('key', $key)->first();
+        } catch (\Throwable $e) {
+            return null;
+        }
+
+        if (!$row) {
+            return null;
+        }
+
+        $decoded = json_decode((string) $row->value, true);
+        if (!is_array($decoded)) {
+            return null;
+        }
+
+        return array_merge($this->defaultSlot(), $decoded);
+    }
+
+    private function saveSlot(string $name, array $slot): void
+    {
+        $key = self::SLOT_PREFIX . $name;
+        $value = json_encode($slot, JSON_UNESCAPED_UNICODE);
+        $this->set($key, $value);
     }
 
     private function ensureTable(): void
@@ -284,8 +371,8 @@ class AdManager implements AdManagerInterface
             $hint = $table === 'ad_settings'
                 ? "Run 'php reactor.php migrate' to create it."
                 : "The default migration creates 'ad_settings', not '{$table}'. "
-                  . "Provide a custom migration for a renamed table, or revert "
-                  . "AdConfig::table() to the default.";
+                  . 'Provide a custom migration for a renamed table, or revert '
+                  . 'AdConfig::table() to the default.';
 
             throw new \RuntimeException(
                 "Ad settings table '{$table}' does not exist. {$hint}"
@@ -295,8 +382,28 @@ class AdManager implements AdManagerInterface
         $this->tableVerified = true;
     }
 
-    private function sendAd(int $userId, string $strategy, string $chatId, int $messageId, string $type): void
+    private function deliver(string $name, int $userId): bool
     {
+        if (!$this->isEnabled($name)) {
+            $this->logger->debug('Ad delivery skipped: slot is disabled', [
+                'slot'    => $name,
+                'user_id' => $userId,
+            ]);
+            return false;
+        }
+
+        if (!$this->hasMessage($name)) {
+            $this->logger->debug('Ad delivery skipped: slot has no source configured', [
+                'slot'    => $name,
+                'user_id' => $userId,
+            ]);
+            return false;
+        }
+
+        $strategy   = $this->getStrategy($name);
+        $chatId     = $this->getChatId($name);
+        $messageId  = $this->getMessageId($name);
+
         // A numeric chat id (private chat, group, channel) must be sent
         // as an integer; a username (@channel) stays a string.
         $fromChatId = is_numeric($chatId) ? (int) $chatId : $chatId;
@@ -307,12 +414,14 @@ class AdManager implements AdManagerInterface
                 : $this->client->copyMessage($userId, $fromChatId, $messageId);
 
             $future->await();
+            return true;
         } catch (\Throwable $e) {
             $this->logger->warning('Failed to send ad', [
                 'user_id' => $userId,
-                'type'    => $type,
+                'slot'    => $name,
                 'error'   => $e->getMessage(),
             ]);
+            return false;
         }
     }
 }

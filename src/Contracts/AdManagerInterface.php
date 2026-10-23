@@ -7,23 +7,24 @@ namespace AfazTech\ReactorAd\Contracts;
 /**
  * Public API of the reactor-ad package.
  *
- * Two independent ad slots are exposed:
+ * Named slots: instead of a fixed set of pre-defined slots, the host
+ * application creates any number of slots by name and configures each
+ * one independently. A slot carries:
  *
- *   - Random ad: sent after a user update with a configurable
- *     probability (0..100). The host application decides when to call
- *     sendRandomAd() (typically from a HANDLER_EXECUTED listener).
+ *   - strategy     : "copy" or "forward"
+ *   - chat_id      : numeric chat id or "@username"
+ *   - message_id   : source message id
+ *   - probability  : 0..100, used only by sendRandom()
+ *   - enabled      : master on/off switch
  *
- *   - Start ad: sent once per /start flow, before the greeting. The
- *     host application calls sendStartAd() from its own /start
- *     handler.
+ * Delivery is entirely up to the host application. Two methods are
+ * exposed:
  *
- * Both slots share the same shape: strategy ("copy" or "forward"),
- * source chat id, source message id, and an on/off flag. Random ads
- * additionally carry a probability.
+ *   - send($name, $userId)        deterministic; ignores probability
+ *   - sendRandom($name, $userId)  probabilistic; respects probability
  *
- * The package performs no UI and no automatic hooks. Every read/write
- * and every delivery is explicit so the host application can decide
- * where and when ads fire.
+ * Both respect the enabled flag and require a configured source. The
+ * package ships no handler, no middleware and no event listener.
  *
  * Storage lives in the "ad_settings" table created by the package
  * migration. Run "php reactor.php migrate" after installation.
@@ -31,104 +32,136 @@ namespace AfazTech\ReactorAd\Contracts;
 interface AdManagerInterface
 {
     // -----------------------------------------------------------------
-    // Random ad lifecycle
+    // Slot lifecycle
     // -----------------------------------------------------------------
 
-    public function isRandomEnabled(): bool;
-
-    public function setRandomEnabled(bool $enabled): void;
-
     /**
-     * Probability of delivery for one update, in the range 0..100.
-     * 0 means "never", 100 means "on every update".
+     * Create a slot with default (empty, disabled) configuration.
+     *
+     * Idempotent: creating a slot that already exists is a no-op, so
+     * callers do not need to check hasSlot() first. Slot names must
+     * match /^[A-Za-z0-9_-]{1,32}$/.
+     *
+     * @throws \InvalidArgumentException When the name is invalid.
      */
-    public function randomProbability(): int;
-
-    public function setRandomProbability(int $probability): void;
+    public function createSlot(string $name): void;
 
     /**
-     * Delivery strategy for the random slot: "copy" or "forward".
+     * Permanently remove a slot and its configuration.
      */
-    public function randomStrategy(): string;
+    public function deleteSlot(string $name): void;
 
     /**
-     * Source chat id as stored (numeric string, e.g. "-1001234567890",
-     * or a username string, e.g. "@channel"). Empty when unconfigured.
+     * Whether the named slot exists.
      */
-    public function randomChatId(): string;
+    public function hasSlot(string $name): bool;
 
     /**
-     * Source message id. 0 when unconfigured.
+     * List the names of every existing slot.
+     *
+     * @return array<int, string>
      */
-    public function randomMessageId(): int;
+    public function listSlots(): array;
+
+    // -----------------------------------------------------------------
+    // Slot configuration
+    // -----------------------------------------------------------------
 
     /**
-     * True when both a source chat id and a positive message id are
+     * Set the source message for a slot and enable it.
+     *
+     * "strategy" must be "copy" or "forward"; anything else falls back
+     * to "copy". "chatId" may be a numeric chat id (as int) or a
+     * username string (as string starting with "@"). "messageId" must
+     * be a positive integer to be deliverable.
+     *
+     * Enabling on save matches the intuitive flow: the admin configures
+     * a slot because they want it to fire. Use setEnabled(false)
+     * afterwards to turn it off without losing the source.
+     */
+    public function setSource(string $name, string $strategy, int|string $chatId, int $messageId): void;
+
+    /**
+     * Set the delivery probability of a slot, in the range 0..100.
+     *
+     * 0 means "never", 100 means "on every sendRandom() call". Values
+     * are clamped to the range. This value is only consulted by
+     * sendRandom(); send() always delivers regardless of probability.
+     */
+    public function setProbability(string $name, int $probability): void;
+
+    /**
+     * Turn a slot on or off.
+     *
+     * The enabled flag is the master switch: both send() and
+     * sendRandom() return false when it is off.
+     */
+    public function setEnabled(string $name, bool $enabled): void;
+
+    /**
+     * Reset every configuration field of a slot to its default value
+     * (empty source, strategy "copy", probability 100, disabled) while
+     * keeping the slot itself.
+     */
+    public function clearSlot(string $name): void;
+
+    // -----------------------------------------------------------------
+    // Slot state
+    // -----------------------------------------------------------------
+
+    public function isEnabled(string $name): bool;
+
+    /**
+     * Delivery strategy of the slot: "copy" or "forward".
+     */
+    public function getStrategy(string $name): string;
+
+    /**
+     * Source chat id as stored (numeric string or "@username"), or ""
+     * when unconfigured.
+     */
+    public function getChatId(string $name): string;
+
+    /**
+     * Source message id, or 0 when unconfigured.
+     */
+    public function getMessageId(string $name): int;
+
+    /**
+     * Delivery probability of the slot, in the range 0..100.
+     */
+    public function getProbability(string $name): int;
+
+    /**
+     * True when both a non-empty chat id and a positive message id are
      * present. The slot is deliverable only when this returns true.
      */
-    public function hasRandomMessage(): bool;
+    public function hasMessage(string $name): bool;
+
+    // -----------------------------------------------------------------
+    // Delivery
+    // -----------------------------------------------------------------
 
     /**
-     * Save a complete random-ad configuration in a single call. Also
-     * flips the enabled flag to true so that a successful capture
-     * immediately activates the slot (matches the historical admin UI
-     * behavior).
+     * Deliver the slot to the given user unconditionally.
      *
-     * @param string     $strategy  "copy" or "forward"; anything else
-     *                              falls back to "copy".
-     * @param int|string $chatId    Numeric chat id or username string.
-     * @param int        $messageId Source message id (> 0).
+     * Ignores probability. Requires the slot to be enabled and
+     * configured. Returns true on successful delivery, false when the
+     * slot is disabled, unconfigured, or delivery failed. Delivery
+     * failures are logged at warning level and never propagate.
      */
-    public function setRandomSource(string $strategy, int|string $chatId, int $messageId): void;
+    public function send(string $name, int $userId): bool;
 
     /**
-     * Clear the random slot entirely: disable, reset strategy to
-     * "copy", clear chat_id and message_id, reset probability to 0.
+     * Deliver the slot to the given user only when the random dice
+     * passes against the slot's probability.
+     *
+     * Returns true on successful delivery, false when the slot is
+     * disabled, unconfigured, the probability roll failed, or delivery
+     * failed. Delivery failures are logged at warning level and never
+     * propagate.
      */
-    public function clearRandom(): void;
-
-    /**
-     * Roll the probability dice and, when it succeeds, deliver the
-     * random ad to $userId. Never throws — delivery failures are
-     * logged at warning level so the caller's flow is not interrupted.
-     */
-    public function sendRandomAd(int $userId): void;
-
-    // -----------------------------------------------------------------
-    // Start ad lifecycle
-    // -----------------------------------------------------------------
-
-    public function isStartEnabled(): bool;
-
-    public function setStartEnabled(bool $enabled): void;
-
-    /**
-     * Delivery strategy for the start slot: "copy" or "forward".
-     */
-    public function startStrategy(): string;
-
-    public function startChatId(): string;
-
-    public function startMessageId(): int;
-
-    public function hasStartMessage(): bool;
-
-    /**
-     * Save a complete start-ad configuration in a single call. Also
-     * flips the enabled flag to true.
-     */
-    public function setStartSource(string $strategy, int|string $chatId, int $messageId): void;
-
-    /**
-     * Clear the start slot entirely (no probability to reset here).
-     */
-    public function clearStart(): void;
-
-    /**
-     * Deliver the start ad to $userId. Never throws — failures are
-     * logged at warning level.
-     */
-    public function sendStartAd(int $userId): void;
+    public function sendRandom(string $name, int $userId): bool;
 
     // -----------------------------------------------------------------
     // Low-level escape hatch
@@ -136,9 +169,9 @@ interface AdManagerInterface
 
     /**
      * Read any key from the ad_settings table, with in-process caching.
-     * Use this for custom keys that are not part of the two standard
-     * slots (e.g. feature flags). Standard callers should use the
-     * typed methods above.
+     * Custom callers can use this to store their own feature flags
+     * alongside the slot keys. Prefer the typed methods above for
+     * normal slot work.
      */
     public function get(string $key, string $default = ''): string;
 

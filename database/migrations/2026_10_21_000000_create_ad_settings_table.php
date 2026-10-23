@@ -11,24 +11,18 @@ use Reactor\Database\Migrations\Migration;
  * Creates the "ad_settings" key/value table used by the reactor-ad
  * package.
  *
- * When upgrading an existing application that used the legacy
- * "settings" table for ad keys (random_ad_*, start_ad_*), this
- * migration copies those rows into the new table so the admin's
- * configured ad does not disappear on the upgrade.
+ * Each named slot is stored as a single row whose value is a JSON
+ * document:
  *
- * The copy is per-key and idempotent: keys already present in
- * ad_settings are left untouched. That makes the migration safe to
- * re-run and prevents re-copying stale values after a
- * rollback + re-migrate cycle.
+ *   key   = "slot:{name}"
+ *   value = {"strategy":"copy","chat_id":"-100...","message_id":42,
+ *            "probability":30,"enabled":true}
  *
- * Schema safety: the legacy "settings" table is only queried when it
- * has both a "key" and a "value" column, so the migration is harmless
- * on applications that use a "settings" table with a different shape.
+ * Custom keys (feature flags, ad impression caps, ...) can share the
+ * same table; the package only claims the "slot:" prefix.
  *
- * NOTE: this migration should not be rolled back after the app has
- * already written to ad_settings in production. A rollback drops the
- * table and its data; the only remaining source of truth would be the
- * (now stale) legacy "settings" rows.
+ * The value column is TEXT because slot payloads can grow beyond 255
+ * bytes once chat_id carries a username and future fields are added.
  */
 class CreateAdSettingsTable extends Migration
 {
@@ -43,72 +37,14 @@ class CreateAdSettingsTable extends Migration
             $this->db->schema()->create('ad_settings', function ($table) {
                 $table->id();
                 $table->string('key', 64)->unique();
-                $table->string('value', 255);
+                $table->text('value');
                 $table->timestamps();
             });
         }
-
-        $this->copyFromLegacySettings();
     }
 
     public function down(): void
     {
         $this->db->schema()->dropIfExists('ad_settings');
-    }
-
-    private function copyFromLegacySettings(): void
-    {
-        if (!$this->db->schema()->hasTable('settings')) {
-            return;
-        }
-
-        // Verify the legacy table actually has the expected columns.
-        // If another application uses a "settings" table with a
-        // different schema, the copy is silently skipped rather than
-        // failing the whole migration.
-        try {
-            $columns = $this->db->schema()->getColumnListing('settings');
-        } catch (\Throwable $e) {
-            return;
-        }
-
-        if (!in_array('key', $columns, true) || !in_array('value', $columns, true)) {
-            return;
-        }
-
-        try {
-            $rows = $this->db->table('settings')
-                ->where('key', 'like', 'random_ad_%')
-                ->orWhere('key', 'like', 'start_ad_%')
-                ->get();
-        } catch (\Throwable $e) {
-            return;
-        }
-
-        if (count($rows) === 0) {
-            return;
-        }
-
-        $existing = array_map(
-            'strval',
-            $this->db->table('ad_settings')->pluck('key')->toArray()
-        );
-        $existing = array_flip($existing);
-
-        $now = date('Y-m-d H:i:s');
-
-        foreach ($rows as $row) {
-            $key = (string) ($row->key ?? '');
-            if ($key === '' || isset($existing[$key])) {
-                continue;
-            }
-
-            $this->db->table('ad_settings')->insert([
-                'key'        => $key,
-                'value'      => (string) ($row->value ?? ''),
-                'created_at' => $now,
-                'updated_at' => $now,
-            ]);
-        }
     }
 }
