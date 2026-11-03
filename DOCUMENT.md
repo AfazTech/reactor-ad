@@ -48,8 +48,8 @@ The package registers no handler, no middleware, and no event listener. It is a 
 
 ## Requirements
 
-- PHP >= 8.1
-- `afaztech/reactor-framework` ^0.5.0
+- PHP >= 8.4
+- `afaztech/reactor-framework` ^0.9.0
 
 The framework provides `Neili\Client`, `DatabaseManagerInterface`, and `LoggerInterface` — the package's only runtime dependencies.
 
